@@ -17,7 +17,7 @@ def _int_env(name: str, default: int) -> int:
 
 class Config:
     DB_USER = os.getenv("DB_USER", "root")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "root")
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = _int_env("DB_PORT", 3306)
     DB_NAME = os.getenv("DB_NAME", "SafeDocs")
