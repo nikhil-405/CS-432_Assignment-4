@@ -8,9 +8,9 @@ from flask import current_app, g, jsonify, redirect, request, url_for
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .config import Config
-from .database import get_session
-from .models import CoreMemberLink, CoreSession, CoreUser
+from config import Config
+from database import get_session
+from models import CoreMemberLink, CoreSession, CoreUser
 
 
 @dataclass

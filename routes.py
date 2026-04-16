@@ -6,10 +6,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from .audit import log_audit_event
-from .auth import issue_session, login_required, validate_session
-from .database import get_missing_project_tables, get_session, next_numeric_id
-from .models import CoreAuditState, CoreGroupMembership, CoreMemberLink, CoreSession, CoreUser
+from audit import log_audit_event
+from auth import issue_session, login_required, validate_session
+from database import get_missing_project_tables, get_session, next_numeric_id
+from models import CoreAuditState, CoreGroupMembership, CoreMemberLink, CoreSession, CoreUser
 
 bp = Blueprint("module_b", __name__)
 

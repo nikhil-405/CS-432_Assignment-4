@@ -8,8 +8,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 from werkzeug.security import generate_password_hash
 
-from .config import Config
-from .models import Base, CoreAuditState, CoreUser
+from config import Config
+from models import Base, CoreAuditState, CoreUser
 from sqlalchemy import create_engine
 
 _ENGINE: Engine | None = None

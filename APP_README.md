@@ -1,4 +1,4 @@
-# Module B (Flask + RBAC + Indexing)
+# App (Flask + RBAC + Indexing)
 
 This module implements a local Flask web app and API layer for SafeDocs, with:
 
@@ -12,18 +12,17 @@ This module implements a local Flask web app and API layer for SafeDocs, with:
 
 ## Project Layout
 
-- `module_B/app.py`: app entry point
-- `module_B/__init__.py`: app factory + bootstrap
-- `module_B/routes.py`: UI/API routes
-- `module_B/auth.py`: auth/session validation decorators
-- `module_B/models.py`: core module tables + password tables (`UserPasswords`, `DocPasswords`)
-- `module_B/database.py`: DB session and bootstrap helpers
-- `module_B/audit.py`: audit file + table logging helpers
-- `module_B/templates/`: UI templates
-- `module_B/sql/create_core_tables.sql`: core table DDL
-- `module_B/sql/indexes.sql`: indexing strategy DDL
-- `module_B/benchmark.py`: query timing + EXPLAIN output
-- `module_B/logs/audit.log`: local audit file
+- `app.py`: app entry point
+- `__init__.py`: app factory + bootstrap
+- `routes.py`: UI/API routes
+- `auth.py`: auth/session validation decorators
+- `models.py`: core module tables + password tables (`UserPasswords`, `DocPasswords`)
+- `database.py`: DB session and bootstrap helpers
+- `audit.py`: audit file + table logging helpers
+- `templates/`: UI templates
+- `sql/create_core_tables.sql`: core table DDL
+- `sql/indexes.sql`: indexing strategy DDL
+- `logs/audit.log`: local audit file
 
 ## Environment
 
@@ -34,6 +33,7 @@ Copy the values from `.env.example` into your local `.env` (root or module path)
 - `DB_HOST`
 - `DB_PORT`
 - `DB_NAME`
+- `FLASK_SECRET_KEY`
 - `JWT_SECRET`
 - `DEFAULT_ADMIN_USERNAME`
 - `DEFAULT_ADMIN_PASSWORD`
@@ -51,7 +51,7 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 From repository root:
 
 ```powershell
-venv\Scripts\python.exe -m module_B.app
+python app.py
 ```
 
 Open:
@@ -98,8 +98,8 @@ Open:
 
 ## SQL Optimization Workflow
 
-1. Capture baseline query profile using `module_B/benchmark.py`
-2. Apply indexes from `module_B/sql/indexes.sql`
+1. Capture baseline query profile using the app benchmark tooling.
+2. Apply indexes from `sql/indexes.sql`
 3. Rerun benchmark and compare:
    - `average_ms`
    - EXPLAIN output

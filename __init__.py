@@ -4,12 +4,14 @@ from dotenv import load_dotenv
 from flask import Flask, g
 from sqlalchemy.exc import SQLAlchemyError
 
-load_dotenv()
+# Load .env file from Assignment 4 root
+env_path = Path(__file__).parent / ".env"
+load_dotenv(env_path)
 
-from .audit import ensure_audit_file
-from .config import Config
-from .database import get_missing_project_tables, init_core_schema, seed_default_admin
-from .routes import bp
+from audit import ensure_audit_file
+from config import Config
+from database import get_missing_project_tables, init_core_schema, seed_default_admin
+from routes import bp
 
 
 def create_app() -> Flask:

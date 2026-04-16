@@ -6,7 +6,7 @@ from typing import Any
 from flask import current_app
 from sqlalchemy.orm import Session
 
-from .models import CoreAuditLog
+from models import CoreAuditLog
 
 
 def ensure_audit_file() -> None:
