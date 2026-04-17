@@ -30,7 +30,7 @@ def create_app() -> Flask:
 			missing_tables = get_missing_project_tables()
 			if missing_tables:
 				app.logger.warning(
-					"Project-specific tables are missing. Module B APIs that use Task-1 tables may fail. Missing: %s",
+					"Project-specific tables are missing. APIs that use Task-1 tables may fail. Missing: %s",
 					", ".join(missing_tables),
 				)
 		except SQLAlchemyError as exc:
@@ -50,5 +50,12 @@ def create_app() -> Flask:
 				db_session.rollback()
 			db_session.close()
 			g.db_session = None
+
+		project_db_session = getattr(g, "project_db_session", None)
+		if project_db_session is not None:
+			if exception is not None:
+				project_db_session.rollback()
+			project_db_session.close()
+			g.project_db_session = None
 
 	return app

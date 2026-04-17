@@ -5,11 +5,10 @@ from functools import wraps
 
 import jwt
 from flask import current_app, g, jsonify, redirect, request, url_for
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config import Config
-from database import get_session
+from database import fetch_project_user, get_project_session, get_session, shard_index_for_organization
 from models import CoreMemberLink, CoreSession, CoreUser
 
 
@@ -125,12 +124,9 @@ def validate_session(db_session: Session, token: str | None) -> tuple[AuthContex
     project_organization_id = None
 
     if project_user_id is not None:
-        org_row = db_session.execute(
-            text("SELECT `OrganizationID` FROM `Users` WHERE `UserID` = :user_id"),
-            {"user_id": project_user_id},
-        ).mappings().first()
-        if org_row is not None:
-            project_organization_id = int(org_row["OrganizationID"])
+        project_user_row, _ = fetch_project_user(int(project_user_id))
+        if project_user_row is not None and project_user_row.get("OrganizationID") is not None:
+            project_organization_id = int(project_user_row["OrganizationID"])
 
     return (
         AuthContext(
@@ -174,6 +170,14 @@ def login_required(admin_only: bool = False, page_mode: bool = False):
             g.db_session = db_session
             g.auth_context = context
             g.session_token = token
+            g.project_shard_index = None
+            g.project_db_session = None
+
+            if context is not None and context.project_organization_id is not None:
+                shard_index = shard_index_for_organization(context.project_organization_id)
+                g.project_shard_index = shard_index
+                g.project_db_session = get_project_session(context.project_organization_id)
+
             return func(*args, **kwargs)
 
         return wrapper

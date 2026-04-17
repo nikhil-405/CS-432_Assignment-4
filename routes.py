@@ -8,7 +8,21 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from audit import log_audit_event
 from auth import issue_session, login_required, validate_session
-from database import get_missing_project_tables, get_session, next_numeric_id
+from database import (
+    fetch_project_document,
+    fetch_project_document_password,
+    fetch_project_permission,
+    fetch_project_user,
+    get_missing_project_tables,
+    get_project_session,
+    get_session,
+    get_shard_indices,
+    get_shard_session,
+    load_reference_maps,
+    next_numeric_id,
+    shard_index_for_organization,
+    tenant_table_name,
+)
 from models import CoreAuditState, CoreGroupMembership, CoreMemberLink, CoreSession, CoreUser
 
 bp = Blueprint("module_b", __name__)
@@ -79,6 +93,85 @@ def _project_tables_ready():
     return True, None, None
 
 
+def _reference_maps() -> dict[str, dict[int, str]]:
+    return load_reference_maps()
+
+
+def _organization_name(organization_id: int | None) -> str | None:
+    if organization_id is None:
+        return None
+    return _reference_maps()["organizations"].get(int(organization_id))
+
+
+def _role_name(role_id: int | None) -> str | None:
+    if role_id is None:
+        return None
+    return _reference_maps()["roles"].get(int(role_id))
+
+
+def _tenant_session_for_auth(auth_context):
+    if auth_context.project_organization_id is None:
+        return None
+    return g.project_db_session or get_project_session(auth_context.project_organization_id)
+
+
+def _tenant_session_for_org(organization_id: int):
+    return get_project_session(organization_id)
+
+
+def _query_shard_mappings(shard_index: int, statement: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    session = get_shard_session(shard_index)
+    try:
+        return session.execute(text(statement), parameters or {}).mappings().all()
+    finally:
+        session.close()
+
+
+def _query_shard_first(shard_index: int, statement: str, parameters: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    session = get_shard_session(shard_index)
+    try:
+        row = session.execute(text(statement), parameters or {}).mappings().first()
+        return dict(row) if row is not None else None
+    finally:
+        session.close()
+
+
+def _project_lookup_user(user_id: int, shard_index: int | None = None) -> tuple[dict[str, Any] | None, int | None]:
+    return fetch_project_user(user_id, shard_index)
+
+
+def _project_lookup_document(doc_id: int, shard_index: int | None = None) -> tuple[dict[str, Any] | None, int | None]:
+    return fetch_project_document(doc_id, shard_index)
+
+
+def _project_lookup_permission(permission_id: int, shard_index: int | None = None) -> tuple[dict[str, Any] | None, int | None]:
+    return fetch_project_permission(permission_id, shard_index)
+
+
+def _project_lookup_doc_password(doc_id: int, shard_index: int | None = None) -> tuple[dict[str, Any] | None, int | None]:
+    return fetch_project_document_password(doc_id, shard_index)
+
+
+def _project_user_table(shard_index: int) -> str:
+    return tenant_table_name("Users", shard_index)
+
+
+def _project_document_table(shard_index: int) -> str:
+    return tenant_table_name("Documents", shard_index)
+
+
+def _project_permission_table(shard_index: int) -> str:
+    return tenant_table_name("Permissions", shard_index)
+
+
+def _project_doc_password_table(shard_index: int) -> str:
+    return tenant_table_name("DocPasswords", shard_index)
+
+
+def _project_user_password_table(shard_index: int) -> str:
+    return tenant_table_name("UserPasswords", shard_index)
+
+
 def _format_username_as_display_name(username: str) -> str:
     cleaned = username.replace("_", " ").replace(".", " ").replace("-", " ").strip()
     if not cleaned:
@@ -86,25 +179,45 @@ def _format_username_as_display_name(username: str) -> str:
     return " ".join(part.capitalize() for part in cleaned.split())
 
 
-def _resolve_display_name(db_session, auth_context) -> str:
-    raw_username = str(auth_context.core_user.username or "").strip()
-    formatted_username = _format_username_as_display_name(raw_username)
+def _project_all_users(search: str = "") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for shard_index in get_shard_indices():
+        query = (
+            f"SELECT `UserID`, `Name`, `Email`, `ContactNumber`, `Age`, `RoleID`, `OrganizationID`, `AccountStatus` "
+            f"FROM `{_project_user_table(shard_index)}`"
+        )
+        params: dict[str, Any] = {}
+        if search:
+            query += " WHERE (`Name` LIKE :search OR `Email` LIKE :search OR CAST(`UserID` AS CHAR) LIKE :search)"
+            params["search"] = f"%{search}%"
+        query += " ORDER BY `UserID`"
+        shard_rows = _query_shard_mappings(shard_index, query, params)
+        for row in shard_rows:
+            row_dict = dict(row)
+            row_dict["OrganizationName"] = _organization_name(int(row_dict["OrganizationID"]))
+            row_dict["RoleName"] = _role_name(int(row_dict["RoleID"])) if row_dict.get("RoleID") is not None else None
+            row_dict["ShardIndex"] = shard_index
+            rows.append(row_dict)
+    return sorted(rows, key=lambda item: int(item["UserID"]))
 
-    if auth_context.project_user_id is not None:
-        row = db_session.execute(
-            text("SELECT `Name` FROM `Users` WHERE `UserID` = :user_id"),
-            {"user_id": auth_context.project_user_id},
-        ).mappings().first()
-        if row is not None:
-            name = str(row.get("Name") or "").strip()
-            if name:
-                if raw_username and name == raw_username:
-                    return formatted_username
-                if any(ch in name for ch in ("_", "-", ".")):
-                    return _format_username_as_display_name(name)
-                return name
 
-    return formatted_username
+def _project_members_for_org(organization_id: int) -> list[dict[str, Any]]:
+    shard_index = shard_index_for_organization(organization_id)
+    rows = _query_shard_mappings(
+        shard_index,
+        f"""
+        SELECT `UserID`, `Name`, `Email`, `ContactNumber`, `Age`, `RoleID`, `OrganizationID`, `AccountStatus`
+        FROM `{_project_user_table(shard_index)}`
+        WHERE `OrganizationID` = :organization_id
+        ORDER BY `UserID`
+        LIMIT 300
+        """,
+        {"organization_id": organization_id},
+    )
+    for row in rows:
+        row["OrganizationName"] = _organization_name(int(row["OrganizationID"]))
+        row["RoleName"] = _role_name(int(row["RoleID"])) if row.get("RoleID") is not None else None
+    return rows
 
 
 def _document_from_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -125,230 +238,209 @@ def _document_from_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _document_row_with_annotations(row: dict[str, Any]) -> dict[str, Any]:
+    row_dict = dict(row)
+    row_dict["OrganizationName"] = _organization_name(int(row_dict["OrganizationID"]))
+    return row_dict
+
+
+def _resolve_display_name(db_session, auth_context) -> str:
+    raw_username = str(auth_context.core_user.username or "").strip()
+    formatted_username = _format_username_as_display_name(raw_username)
+
+    if auth_context.project_user_id is not None:
+        user_row, _ = _project_lookup_user(int(auth_context.project_user_id), getattr(g, "project_shard_index", None))
+        if user_row is not None:
+            name = str(user_row.get("Name") or "").strip()
+            if name:
+                if raw_username and name == raw_username:
+                    return formatted_username
+                if any(ch in name for ch in ("_", "-", ".")):
+                    return _format_username_as_display_name(name)
+                return name
+
+    return formatted_username
+
+
 def _document_exists(db_session, doc_id: int) -> bool:
-    return db_session.execute(
-        text("SELECT 1 FROM `Documents` WHERE `DocID` = :doc_id"),
-        {"doc_id": doc_id},
-    ).first() is not None
+    return _project_lookup_document(doc_id)[0] is not None
 
 
-def _count_accessible_documents(db_session, auth_context) -> int:
+def _count_documents_for_shard(shard_index: int, auth_context) -> int:
     if auth_context.core_user.role == "Admin":
-        return int(db_session.execute(text("SELECT COUNT(*) FROM `Documents`")).scalar_one())
+        row = _query_shard_first(shard_index, f"SELECT COUNT(*) AS count FROM `{_project_document_table(shard_index)}`")
+        return int(row["count"] if row else 0)
 
     if auth_context.project_user_id is None:
         return 0
 
-    return int(
-        db_session.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM `Documents` d
-                WHERE d.`OwnerUserID` = :project_user_id
-                   OR EXISTS (
-                        SELECT 1
-                        FROM `Permissions` p
-                        WHERE p.`DocID` = d.`DocID`
-                          AND p.`UserID` = :project_user_id
-                          AND p.`AccessType` IN ('View', 'Edit', 'Delete')
-                   )
-                """
-            ),
-            {"project_user_id": auth_context.project_user_id},
-        ).scalar_one()
+    row = _query_shard_first(
+        shard_index,
+        f"""
+        SELECT COUNT(*) AS `count`
+        FROM `{_project_document_table(shard_index)}` d
+        WHERE d.`OwnerUserID` = :project_user_id
+           OR EXISTS (
+                SELECT 1
+                FROM `{_project_permission_table(shard_index)}` p
+                WHERE p.`DocID` = d.`DocID`
+                  AND p.`UserID` = :project_user_id
+                  AND p.`AccessType` IN ('View', 'Edit', 'Delete')
+           )
+        """,
+        {"project_user_id": auth_context.project_user_id},
     )
+    return int(row["count"] if row else 0)
+
+
+def _count_accessible_documents(db_session, auth_context) -> int:
+    if auth_context.core_user.role == "Admin":
+        return sum(_count_documents_for_shard(shard_index, auth_context) for shard_index in get_shard_indices())
+
+    if auth_context.project_organization_id is None:
+        return 0
+
+    return _count_documents_for_shard(shard_index_for_organization(auth_context.project_organization_id), auth_context)
 
 
 def _list_accessible_documents(db_session, auth_context, limit: int) -> list[dict[str, Any]]:
-    if auth_context.core_user.role == "Admin":
-        rows = db_session.execute(
-            text(
-                """
-                SELECT
-                    d.*,
-                    u.`Name` AS `OwnerName`,
-                    o.`OrgName` AS `OrganizationName`
-                FROM `Documents` d
-                LEFT JOIN `Users` u ON u.`UserID` = d.`OwnerUserID`
-                LEFT JOIN `Organizations` o ON o.`OrganizationID` = d.`OrganizationID`
+    rows: list[dict[str, Any]] = []
+    shard_indices = list(get_shard_indices()) if auth_context.core_user.role == "Admin" else (
+        [shard_index_for_organization(auth_context.project_organization_id)] if auth_context.project_organization_id is not None else []
+    )
+
+    for shard_index in shard_indices:
+        if auth_context.core_user.role == "Admin":
+            query = f"""
+                SELECT d.*, u.`Name` AS `OwnerName`
+                FROM `{_project_document_table(shard_index)}` d
+                LEFT JOIN `{_project_user_table(shard_index)}` u ON u.`UserID` = d.`OwnerUserID`
                 ORDER BY d.`LastModifiedAt` DESC
                 LIMIT :limit
-                """
-            ),
-            {"limit": limit},
-        ).mappings().all()
-
-        docs = []
-        for row in rows:
-            doc = _document_from_row(dict(row))
-            doc["CanView"] = True
-            doc["CanEdit"] = True
-            doc["CanDelete"] = True
-            doc["IsOwner"] = True
-            docs.append(doc)
-        return docs
-
-    if auth_context.project_user_id is None:
-        return []
-
-    rows = db_session.execute(
-        text(
             """
+            shard_rows = _query_shard_mappings(shard_index, query, {"limit": limit})
+            for row in shard_rows:
+                doc = _document_from_row(_document_row_with_annotations(dict(row)))
+                doc["CanView"] = True
+                doc["CanEdit"] = True
+                doc["CanDelete"] = True
+                doc["IsOwner"] = True
+                rows.append(doc)
+            continue
+
+        query = f"""
             SELECT
-                d.*,
-                u.`Name` AS `OwnerName`,
-                o.`OrgName` AS `OrganizationName`,
+                d.*, u.`Name` AS `OwnerName`,
                 CASE WHEN d.`OwnerUserID` = :project_user_id THEN 1 ELSE 0 END AS `IsOwner`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` IN ('View', 'Edit', 'Delete')
                 ) AS `HasViewPermission`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` IN ('Edit', 'Delete')
                 ) AS `HasEditPermission`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` = 'Delete'
                 ) AS `HasDeletePermission`
-            FROM `Documents` d
-            LEFT JOIN `Users` u ON u.`UserID` = d.`OwnerUserID`
-            LEFT JOIN `Organizations` o ON o.`OrganizationID` = d.`OrganizationID`
+            FROM `{_project_document_table(shard_index)}` d
+            LEFT JOIN `{_project_user_table(shard_index)}` u ON u.`UserID` = d.`OwnerUserID`
             WHERE d.`OwnerUserID` = :project_user_id
                OR EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` IN ('View', 'Edit', 'Delete')
                )
             ORDER BY d.`LastModifiedAt` DESC
             LIMIT :limit
-            """
-        ),
-        {"project_user_id": auth_context.project_user_id, "limit": limit},
-    ).mappings().all()
+        """
+        shard_rows = _query_shard_mappings(shard_index, query, {"project_user_id": auth_context.project_user_id, "limit": limit})
+        for row in shard_rows:
+            row_dict = _document_row_with_annotations(dict(row))
+            is_owner = bool(row_dict.get("IsOwner"))
+            doc = _document_from_row(row_dict)
+            doc["CanView"] = is_owner or bool(row_dict.get("HasViewPermission"))
+            doc["CanEdit"] = is_owner or bool(row_dict.get("HasEditPermission"))
+            doc["CanDelete"] = is_owner or bool(row_dict.get("HasDeletePermission"))
+            doc["IsOwner"] = is_owner
+            rows.append(doc)
 
-    docs = []
-    for row in rows:
-        row_dict = dict(row)
-        is_owner = bool(row_dict.get("IsOwner"))
-        can_view = is_owner or bool(row_dict.get("HasViewPermission"))
-        can_edit = is_owner or bool(row_dict.get("HasEditPermission"))
-        can_delete = is_owner or bool(row_dict.get("HasDeletePermission"))
-
-        doc = _document_from_row(row_dict)
-        doc["CanView"] = can_view
-        doc["CanEdit"] = can_edit
-        doc["CanDelete"] = can_delete
-        doc["IsOwner"] = is_owner
-        docs.append(doc)
-
-    return docs
+    rows.sort(key=lambda item: item["LastModifiedAt"] or "", reverse=True)
+    return rows[:limit]
 
 
 def _get_document_with_access(db_session, auth_context, doc_id: int) -> dict[str, Any] | None:
-    if auth_context.core_user.role == "Admin":
-        row = db_session.execute(
-            text(
-                """
-                SELECT
-                    d.*,
-                    u.`Name` AS `OwnerName`,
-                    o.`OrgName` AS `OrganizationName`
-                FROM `Documents` d
-                LEFT JOIN `Users` u ON u.`UserID` = d.`OwnerUserID`
-                LEFT JOIN `Organizations` o ON o.`OrganizationID` = d.`OrganizationID`
-                WHERE d.`DocID` = :doc_id
-                """
-            ),
-            {"doc_id": doc_id},
-        ).mappings().first()
-        if row is None:
-            return None
+    shard_indices = list(get_shard_indices()) if auth_context.core_user.role == "Admin" else (
+        [shard_index_for_organization(auth_context.project_organization_id)] if auth_context.project_organization_id is not None else []
+    )
 
-        doc = _document_from_row(dict(row))
-        doc["CanView"] = True
-        doc["CanEdit"] = True
-        doc["CanDelete"] = True
-        doc["IsOwner"] = True
-        return doc
+    for shard_index in shard_indices:
+        params: dict[str, Any] = {"doc_id": doc_id}
+        if auth_context.project_user_id is not None:
+            params["project_user_id"] = auth_context.project_user_id
 
-    if auth_context.project_user_id is None:
-        return None
-
-    row = db_session.execute(
-        text(
-            """
+        row = _query_shard_first(
+            shard_index,
+            f"""
             SELECT
-                d.*,
-                u.`Name` AS `OwnerName`,
-                o.`OrgName` AS `OrganizationName`,
+                d.*, u.`Name` AS `OwnerName`,
                 CASE WHEN d.`OwnerUserID` = :project_user_id THEN 1 ELSE 0 END AS `IsOwner`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` IN ('View', 'Edit', 'Delete')
                 ) AS `HasViewPermission`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` IN ('Edit', 'Delete')
                 ) AS `HasEditPermission`,
                 EXISTS (
-                    SELECT 1 FROM `Permissions` p
+                    SELECT 1 FROM `{_project_permission_table(shard_index)}` p
                     WHERE p.`DocID` = d.`DocID`
                       AND p.`UserID` = :project_user_id
                       AND p.`AccessType` = 'Delete'
                 ) AS `HasDeletePermission`
-            FROM `Documents` d
-                LEFT JOIN `Users` u ON u.`UserID` = d.`OwnerUserID`
-                LEFT JOIN `Organizations` o ON o.`OrganizationID` = d.`OrganizationID`
+            FROM `{_project_document_table(shard_index)}` d
+            LEFT JOIN `{_project_user_table(shard_index)}` u ON u.`UserID` = d.`OwnerUserID`
             WHERE d.`DocID` = :doc_id
-              AND (
-                    d.`OwnerUserID` = :project_user_id
-                 OR EXISTS (
-                        SELECT 1 FROM `Permissions` p
-                        WHERE p.`DocID` = d.`DocID`
-                          AND p.`UserID` = :project_user_id
-                          AND p.`AccessType` IN ('View', 'Edit', 'Delete')
-                 )
-              )
-            """
-        ),
-        {"doc_id": doc_id, "project_user_id": auth_context.project_user_id},
-    ).mappings().first()
+            """,
+            params,
+        )
+        if row is None:
+            continue
 
-    if row is None:
-        return None
+        row_dict = _document_row_with_annotations(row)
+        is_owner = auth_context.project_user_id is not None and int(row_dict["OwnerUserID"]) == int(auth_context.project_user_id)
+        if auth_context.core_user.role != "Admin" and not (is_owner or bool(row_dict.get("HasViewPermission"))):
+            return None
 
-    row_dict = dict(row)
-    is_owner = bool(row_dict.get("IsOwner"))
-    can_view = is_owner or bool(row_dict.get("HasViewPermission"))
-    can_edit = is_owner or bool(row_dict.get("HasEditPermission"))
-    can_delete = is_owner or bool(row_dict.get("HasDeletePermission"))
+        doc = _document_from_row(row_dict)
+        doc["CanView"] = True if auth_context.core_user.role == "Admin" else is_owner or bool(row_dict.get("HasViewPermission"))
+        doc["CanEdit"] = True if auth_context.core_user.role == "Admin" else is_owner or bool(row_dict.get("HasEditPermission"))
+        doc["CanDelete"] = True if auth_context.core_user.role == "Admin" else is_owner or bool(row_dict.get("HasDeletePermission"))
+        doc["IsOwner"] = is_owner or auth_context.core_user.role == "Admin"
+        return doc
 
-    doc = _document_from_row(row_dict)
-    doc["CanView"] = can_view
-    doc["CanEdit"] = can_edit
-    doc["CanDelete"] = can_delete
-    doc["IsOwner"] = is_owner
-    return doc
+    return None
 
 
 def _verify_document_password(db_session, doc_id: int, candidate_password: str) -> bool:
-    password_row = db_session.execute(
-        text("SELECT `PasswordHash` FROM `DocPasswords` WHERE `DocID` = :doc_id"),
-        {"doc_id": doc_id},
-    ).mappings().first()
+    doc_row, shard_index = _project_lookup_document(doc_id)
+    if doc_row is None or shard_index is None:
+        return False
+
+    password_row, _ = _project_lookup_doc_password(doc_id, shard_index)
     if password_row is None:
         return False
     return check_password_hash(str(password_row["PasswordHash"]), candidate_password)
@@ -406,18 +498,20 @@ def login_api():
 
         password_valid = False
         if member_link is not None:
-            password_row = db_session.execute(
-                text(
-                    """
+            project_user_row, project_shard_index = _project_lookup_user(int(member_link.project_user_id))
+            password_row = None
+            if project_user_row is not None and project_shard_index is not None:
+                password_row = _query_shard_first(
+                    project_shard_index,
+                    f"""
                     SELECT `PasswordHash`
-                    FROM `UserPasswords`
+                    FROM `{_project_user_password_table(project_shard_index)}`
                     WHERE `UserID` = :user_id
                       AND `LoginUsername` = :login_username
                       AND `IsActive` = 1
-                    """
-                ),
-                {"user_id": member_link.project_user_id, "login_username": username},
-            ).mappings().first()
+                    """,
+                    {"user_id": member_link.project_user_id, "login_username": username},
+                )
 
             if password_row is not None:
                 password_valid = check_password_hash(str(password_row["PasswordHash"]), password)
@@ -558,62 +652,35 @@ def dashboard():
     if not ready:
         return response, status_code
 
-    db_session = g.db_session
     auth_context = g.auth_context
     page = request.args.get("page", 1, type=int)
     search = request.args.get("search", "", type=str).strip()
     per_page = 10
     offset = (page - 1) * per_page
-    role_options = []
-    organization_options = []
+
+    member_rows: list[dict[str, Any]] = []
+    total_pages = 1
+    role_options: list[dict[str, Any]] = []
+    organization_options: list[dict[str, Any]] = []
 
     if auth_context.core_user.role == "Admin":
-        # Build search query
-        base_query = "SELECT `UserID`, `Name`, `Email`, `OrganizationID`, `AccountStatus` FROM `Users`"
-        count_query = "SELECT COUNT(*) FROM `Users`"
-        params = {}
+        all_members = _project_all_users(search)
+        total_count = len(all_members)
+        member_rows = all_members[offset:offset + per_page]
+        total_pages = max((total_count + per_page - 1) // per_page, 1)
 
-        if search:
-            search_filter = " WHERE (`Name` LIKE :search OR `Email` LIKE :search OR CAST(`UserID` AS CHAR) LIKE :search)"
-            base_query += search_filter
-            count_query += search_filter
-            params["search"] = f"%{search}%"
+        reference_maps = _reference_maps()
+        role_options = [
+            {"RoleID": role_id, "RoleName": role_name}
+            for role_id, role_name in sorted(reference_maps["roles"].items())
+        ]
+        organization_options = [
+            {"OrganizationID": organization_id, "OrgName": org_name}
+            for organization_id, org_name in sorted(reference_maps["organizations"].items())
+        ]
 
-        # Get total count
-        total_count = int(db_session.execute(text(count_query), params).scalar_one())
-
-        # Get paginated results
-        base_query += " ORDER BY `UserID` LIMIT :limit OFFSET :offset"
-        params["limit"] = per_page
-        params["offset"] = offset
-        member_rows = db_session.execute(text(base_query), params).mappings().all()
-        total_pages = (total_count + per_page - 1) // per_page
-
-        role_options = db_session.execute(
-            text(
-                """
-                SELECT `RoleID`, `RoleName`
-                FROM `Roles`
-                ORDER BY `RoleID`
-                """
-            )
-        ).mappings().all()
-
-        organization_options = db_session.execute(
-            text(
-                """
-                SELECT `OrganizationID`, `OrgName`
-                FROM `Organizations`
-                ORDER BY `OrganizationID`
-                """
-            )
-        ).mappings().all()
-    else:
-        member_rows = []
-        total_pages = 1
-
-    document_count = _count_accessible_documents(db_session, auth_context)
-    display_name = _resolve_display_name(db_session, auth_context)
+    document_count = _count_accessible_documents(g.db_session, auth_context)
+    display_name = _resolve_display_name(g.db_session, auth_context)
 
     return render_template(
         "dashboard.html",
@@ -638,25 +705,15 @@ def portfolio(member_id: int):
     if not ready:
         return response, status_code
 
-    db_session = g.db_session
     auth_context = g.auth_context
-
-    member_row = db_session.execute(
-        text(
-            """
-            SELECT u.`UserID`, u.`Name`, u.`Email`, u.`Age`, u.`RoleID`,
-                   r.`RoleName`, u.`OrganizationID`, o.`OrgName`, u.`AccountStatus`
-            FROM `Users` u
-            LEFT JOIN `Roles` r ON r.`RoleID` = u.`RoleID`
-            LEFT JOIN `Organizations` o ON o.`OrganizationID` = u.`OrganizationID`
-            WHERE u.`UserID` = :member_id
-            """
-        ),
-        {"member_id": member_id},
-    ).mappings().first()
+    member_row, _ = _project_lookup_user(member_id)
 
     if member_row is None:
         return jsonify({"error": "Member not found"}), 404
+
+    member_row = dict(member_row)
+    member_row["OrganizationName"] = _organization_name(int(member_row["OrganizationID"]))
+    member_row["RoleName"] = _role_name(int(member_row["RoleID"])) if member_row.get("RoleID") is not None else None
 
     if auth_context.core_user.role != "Admin":
         if auth_context.project_organization_id is None:
@@ -667,7 +724,7 @@ def portfolio(member_id: int):
     # Find the CoreUser linked to this project user (if admin needs to deactivate)
     core_user_id = None
     if auth_context.core_user.role == "Admin":
-        member_link = db_session.query(CoreMemberLink).filter(
+        member_link = g.db_session.query(CoreMemberLink).filter(
             CoreMemberLink.project_user_id == member_id
         ).one_or_none()
         if member_link:
@@ -688,42 +745,17 @@ def members_page():
     if not ready:
         return response, status_code
 
-    db_session = g.db_session
     auth_context = g.auth_context
 
     if auth_context.core_user.role == "Admin":
-        member_rows = db_session.execute(
-            text(
-                """
-                SELECT u.`UserID`, u.`Name`, u.`Email`, u.`OrganizationID`,
-                       o.`OrgName` AS `OrganizationName`, u.`AccountStatus`
-                FROM `Users` u
-                LEFT JOIN `Organizations` o ON o.`OrganizationID` = u.`OrganizationID`
-                ORDER BY u.`UserID`
-                LIMIT 300
-                """
-            )
-        ).mappings().all()
+        member_rows = _project_all_users()[:300]
     else:
         if auth_context.project_organization_id is None:
             return jsonify({"error": "Current user is not mapped to project member data"}), 403
 
-        member_rows = db_session.execute(
-            text(
-                """
-                SELECT u.`UserID`, u.`Name`, u.`Email`, u.`OrganizationID`,
-                       o.`OrgName` AS `OrganizationName`, u.`AccountStatus`
-                FROM `Users` u
-                LEFT JOIN `Organizations` o ON o.`OrganizationID` = u.`OrganizationID`
-                WHERE u.`OrganizationID` = :org_id
-                ORDER BY u.`UserID`
-                LIMIT 300
-                """
-            ),
-            {"org_id": auth_context.project_organization_id},
-        ).mappings().all()
+        member_rows = _project_members_for_org(auth_context.project_organization_id)
 
-    display_name = _resolve_display_name(db_session, auth_context)
+    display_name = _resolve_display_name(g.db_session, auth_context)
 
     return render_template(
         "members.html",
@@ -829,7 +861,6 @@ def create_member():
     if not ready:
         return response, status_code
 
-    db_session = g.db_session
     auth_context = g.auth_context
     data = _payload()
 
@@ -868,6 +899,13 @@ def create_member():
         return jsonify({"error": "age, role_id, and organization_id must be integers"}), 400
 
     try:
+        if organization_id is None:
+            return jsonify({"error": "organization_id is required"}), 400
+
+        project_shard_index = shard_index_for_organization(organization_id)
+        project_session = get_project_session(organization_id)
+        db_session = g.db_session
+
         existing_core_user = (
             db_session.query(CoreUser)
             .filter(CoreUser.username == username)
@@ -884,33 +922,45 @@ def create_member():
             )
             db_session.flush()
 
-        existing_user_password = db_session.execute(
-            text(
-                """
+        existing_user_password = None
+        existing_password_shard = None
+        for shard_index in get_shard_indices():
+            existing_user_password = _query_shard_first(
+                shard_index,
+                f"""
                 SELECT `UserID`, `IsActive`
-                FROM `UserPasswords`
+                FROM `{_project_user_password_table(shard_index)}`
                 WHERE `LoginUsername` = :login_username
-                """
-            ),
-            {"login_username": username},
-        ).mappings().first()
+                """,
+                {"login_username": username},
+            )
+            if existing_user_password is not None:
+                existing_password_shard = shard_index
+                break
 
         if existing_user_password is not None:
             if bool(existing_user_password["IsActive"]):
                 return jsonify({"error": "username already exists"}), 409
 
             # Legacy cleanup for stale inactive credential rows.
-            db_session.execute(
-                text("DELETE FROM `UserPasswords` WHERE `LoginUsername` = :login_username"),
-                {"login_username": username},
-            )
+            cleanup_session = get_shard_session(existing_password_shard) if existing_password_shard is not None else None
+            try:
+                if cleanup_session is not None:
+                    cleanup_session.execute(
+                        text(f"DELETE FROM `{_project_user_password_table(existing_password_shard)}` WHERE `LoginUsername` = :login_username"),
+                        {"login_username": username},
+                    )
+                    cleanup_session.commit()
+            finally:
+                if cleanup_session is not None:
+                    cleanup_session.close()
 
         # 1. Create new project user (Users table)
-        next_user_id = next_numeric_id(db_session, "Users", "UserID")
-        
-        db_session.execute(
+        next_user_id = next_numeric_id(project_session, _project_user_table(project_shard_index), "UserID")
+
+        project_session.execute(
             text("""
-                INSERT INTO `Users` (
+                INSERT INTO `{table_name}` (
                     `UserID`, `Name`, `Email`, `ContactNumber`, `Age`,
                     `RoleID`, `OrganizationID`, `AccountStatus`
                 )
@@ -918,8 +968,7 @@ def create_member():
                     :user_id, :name, :email, :contact_number, :age,
                     :role_id, :org_id, :status
                 )
-            """)
-            ,
+            """.replace("{table_name}", _project_user_table(project_shard_index))),
             {
                 "user_id": next_user_id,
                 "name": name,
@@ -953,17 +1002,16 @@ def create_member():
         )
 
         # 4. Store login credentials for project user accounts.
-        db_session.execute(
+        project_session.execute(
             text(
                 """
-                INSERT INTO `UserPasswords` (
+                INSERT INTO `{table_name}` (
                     `UserID`, `LoginUsername`, `PasswordHash`, `IsActive`, `CreatedAt`, `LastModifiedAt`
                 )
                 VALUES (
                     :user_id, :login_username, :password_hash, 1, :created_at, :last_modified_at
                 )
-                """
-            ),
+                """.replace("{table_name}", _project_user_password_table(project_shard_index))),
             {
                 "user_id": next_user_id,
                 "login_username": username,
@@ -996,6 +1044,7 @@ def create_member():
             },
         )
 
+        project_session.commit()
         db_session.commit()
         return jsonify({
             "message": "Member created",
@@ -1003,9 +1052,17 @@ def create_member():
             "project_user_id": next_user_id,
         }), 201
     except IntegrityError as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 409
     except Exception as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": str(e)}), 500
 
@@ -1034,6 +1091,10 @@ def delete_member(core_user_id: int):
         .one_or_none()
     )
     project_user_id = member_link.project_user_id if member_link else None
+    project_user_row = None
+    project_shard_index = None
+    if project_user_id is not None:
+        project_user_row, project_shard_index = _project_lookup_user(int(project_user_id))
 
     # 1. Deactivate all sessions
     db_session.query(CoreSession).filter(CoreSession.core_user_id == target.id).update(
@@ -1054,15 +1115,25 @@ def delete_member(core_user_id: int):
     target.is_active = False
 
     # 5. Delete project credentials and user row from project tables (if linked)
-    if project_user_id is not None:
-        db_session.execute(
-            text("DELETE FROM `UserPasswords` WHERE `UserID` = :user_id"),
-            {"user_id": project_user_id},
-        )
-        db_session.execute(
-            text("DELETE FROM `Users` WHERE `UserID` = :user_id"),
-            {"user_id": project_user_id},
-        )
+    project_session = None
+    if project_user_id is not None and project_user_row is not None and project_shard_index is not None:
+        project_session = get_shard_session(project_shard_index)
+        try:
+            project_session.execute(
+                text(
+                    f"DELETE FROM `{_project_user_password_table(project_shard_index)}` WHERE `UserID` = :user_id"
+                ),
+                {"user_id": project_user_id},
+            )
+            project_session.execute(
+                text(
+                    f"DELETE FROM `{_project_user_table(project_shard_index)}` WHERE `UserID` = :user_id"
+                ),
+                {"user_id": project_user_id},
+            )
+            project_session.commit()
+        finally:
+            project_session.close()
 
     log_audit_event(
         db_session=db_session,
@@ -1133,7 +1204,6 @@ def create_document():
         if not ready:
             return response, status_code
 
-        db_session = g.db_session
         auth_context = g.auth_context
         data = _payload()
 
@@ -1163,13 +1233,17 @@ def create_document():
         if is_password_protected and (document_password is None or not document_password.strip()):
             return jsonify({"error": "DocumentPassword is required when IsPasswordProtected is true"}), 400
 
+        project_shard_index = shard_index_for_organization(int(data["OrganizationID"]))
+        project_session = get_shard_session(project_shard_index)
+        db_session = g.db_session
+
         now = datetime.utcnow()
-        new_doc_id = next_numeric_id(db_session, "Documents", "DocID")
+        new_doc_id = next_numeric_id(project_session, _project_document_table(project_shard_index), "DocID")
         generated_file_path = f"/secure/storage/doc_{new_doc_id}.pdf"
 
         insert_sql = text(
-            """
-            INSERT INTO `Documents` (
+            f"""
+            INSERT INTO `{_project_document_table(project_shard_index)}` (
                 `DocID`, `DocName`, `DocSize`, `NumberOfPages`, `FilePath`,
                 `ConfidentialityLevel`, `IsPasswordProtected`, `OwnerUserID`,
                 `OrganizationID`, `CreatedAt`, `LastModifiedAt`
@@ -1196,13 +1270,13 @@ def create_document():
             "last_modified_at": now,
         }
 
-        db_session.execute(insert_sql, params)
+        project_session.execute(insert_sql, params)
 
         if is_password_protected and document_password is not None:
-            db_session.execute(
+            project_session.execute(
                 text(
-                    """
-                    INSERT INTO `DocPasswords` (`DocID`, `PasswordHash`, `CreatedAt`, `LastModifiedAt`)
+                    f"""
+                    INSERT INTO `{_project_doc_password_table(project_shard_index)}` (`DocID`, `PasswordHash`, `CreatedAt`, `LastModifiedAt`)
                     VALUES (:doc_id, :password_hash, :created_at, :last_modified_at)
                     """
                 ),
@@ -1230,15 +1304,24 @@ def create_document():
             },
         )
 
+        project_session.commit()
         db_session.commit()
         return jsonify({"message": "Document created", "DocID": new_doc_id}), 201
 
     except IntegrityError as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Database integrity error: {str(e.orig)}"}), 409
     except (ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid input: {str(e)}"}), 400
     except Exception as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Failed to create document: {str(e)}"}), 500
 
@@ -1270,13 +1353,18 @@ def update_document(doc_id: int):
         if has_password_update and not str(document_password).strip():
             return jsonify({"error": "DocumentPassword cannot be empty"}), 400
 
+        current_shard_index = shard_index_for_organization(int(current["OrganizationID"]))
+        project_session = get_shard_session(current_shard_index)
+
         if is_password_protected and not has_password_update:
-            existing_password = db_session.execute(
-                text("SELECT 1 FROM `DocPasswords` WHERE `DocID` = :doc_id"),
-                {"doc_id": doc_id},
-            ).first()
+            existing_password = _project_lookup_doc_password(doc_id, current_shard_index)[0]
             if existing_password is None:
                 return jsonify({"error": "DocumentPassword is required when password protection is enabled"}), 400
+
+        new_org_id = int(data.get("OrganizationID", current["OrganizationID"]))
+        new_shard_index = shard_index_for_organization(new_org_id)
+        if new_shard_index != current_shard_index:
+            return jsonify({"error": "Changing a document between shards is not supported"}), 400
 
         update_columns = {
             "DocName": data.get("DocName", current["DocName"]),
@@ -1290,10 +1378,10 @@ def update_document(doc_id: int):
             "LastModifiedAt": datetime.utcnow(),
         }
 
-        db_session.execute(
+        project_session.execute(
             text(
-                """
-                UPDATE `Documents`
+                f"""
+                UPDATE `{_project_document_table(current_shard_index)}`
                 SET `DocName` = :DocName,
                     `DocSize` = :DocSize,
                     `NumberOfPages` = :NumberOfPages,
@@ -1311,10 +1399,10 @@ def update_document(doc_id: int):
 
         if is_password_protected:
             if has_password_update and document_password is not None:
-                db_session.execute(
+                project_session.execute(
                     text(
-                        """
-                        INSERT INTO `DocPasswords` (`DocID`, `PasswordHash`, `CreatedAt`, `LastModifiedAt`)
+                        f"""
+                        INSERT INTO `{_project_doc_password_table(current_shard_index)}` (`DocID`, `PasswordHash`, `CreatedAt`, `LastModifiedAt`)
                         VALUES (:doc_id, :password_hash, :created_at, :last_modified_at)
                         ON DUPLICATE KEY UPDATE
                             `PasswordHash` = VALUES(`PasswordHash`),
@@ -1329,8 +1417,8 @@ def update_document(doc_id: int):
                     },
                 )
         else:
-            db_session.execute(
-                text("DELETE FROM `DocPasswords` WHERE `DocID` = :doc_id"),
+            project_session.execute(
+                text(f"DELETE FROM `{_project_doc_password_table(current_shard_index)}` WHERE `DocID` = :doc_id"),
                 {"doc_id": doc_id},
             )
 
@@ -1345,15 +1433,24 @@ def update_document(doc_id: int):
             details={"updated_fields": list(data.keys())},
         )
 
+        project_session.commit()
         db_session.commit()
         return jsonify({"message": "Document updated", "DocID": doc_id})
 
     except IntegrityError as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Database integrity error: {str(e.orig)}"}), 409
     except (ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid input: {str(e)}"}), 400
     except Exception as e:
+        try:
+            project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Failed to update document: {str(e)}"}), 500
 
@@ -1385,20 +1482,19 @@ def delete_document(doc_id: int):
             return jsonify({"error": "Document not found"}), 404
 
         # Fetch document info for audit log
-        doc_row = db_session.execute(
-            text("SELECT `DocName`, `OrganizationID` FROM `Documents` WHERE `DocID` = :doc_id"),
-            {"doc_id": doc_id},
-        ).mappings().first()
+        doc_row, doc_shard_index = _project_lookup_document(doc_id)
+        project_session = get_shard_session(doc_shard_index) if doc_shard_index is not None else None
 
-        db_session.execute(
-            text("DELETE FROM `DocPasswords` WHERE `DocID` = :doc_id"),
-            {"doc_id": doc_id},
-        )
+        if project_session is not None and doc_shard_index is not None:
+            project_session.execute(
+                text(f"DELETE FROM `{_project_doc_password_table(doc_shard_index)}` WHERE `DocID` = :doc_id"),
+                {"doc_id": doc_id},
+            )
 
-        db_session.execute(
-            text("DELETE FROM `Documents` WHERE `DocID` = :doc_id"),
-            {"doc_id": doc_id},
-        )
+            project_session.execute(
+                text(f"DELETE FROM `{_project_document_table(doc_shard_index)}` WHERE `DocID` = :doc_id"),
+                {"doc_id": doc_id},
+            )
 
         log_audit_event(
             db_session=db_session,
@@ -1414,13 +1510,25 @@ def delete_document(doc_id: int):
             },
         )
 
+        if project_session is not None:
+            project_session.commit()
         db_session.commit()
         return jsonify({"message": "Document deleted", "DocID": doc_id})
 
     except IntegrityError as e:
+        try:
+            if 'project_session' in locals() and project_session is not None:
+                project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Database integrity error: {str(e.orig)}"}), 409
     except Exception as e:
+        try:
+            if 'project_session' in locals() and project_session is not None:
+                project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Failed to delete document: {str(e)}"}), 500
 
@@ -1450,19 +1558,13 @@ def grant_permission():
         doc_id = int(doc_id)
         user_id = int(user_id)
 
-        document_row = db_session.execute(
-            text(
-                """
-                SELECT `DocID`, `DocName`, `OwnerUserID`, `OrganizationID`
-                FROM `Documents`
-                WHERE `DocID` = :doc_id
-                """
-            ),
-            {"doc_id": doc_id},
-        ).mappings().first()
+        document_row, doc_shard_index = _project_lookup_document(doc_id)
 
         if document_row is None:
             return jsonify({"error": "Document not found"}), 404
+
+        document_row = dict(document_row)
+        project_session = get_shard_session(doc_shard_index) if doc_shard_index is not None else None
 
         is_admin = auth_context.core_user.role == "Admin"
         is_owner = (
@@ -1475,41 +1577,31 @@ def grant_permission():
         if int(document_row["OwnerUserID"]) == user_id:
             return jsonify({"error": "The owner already has full access"}), 400
 
-        target_user = db_session.execute(
-            text(
-                """
-                SELECT `UserID`, `OrganizationID`, `AccountStatus`
-                FROM `Users`
-                WHERE `UserID` = :user_id
-                """
-            ),
-            {"user_id": user_id},
-        ).mappings().first()
+        target_user, _ = _project_lookup_user(user_id)
         if target_user is None:
             return jsonify({"error": "Target user not found"}), 404
 
         if int(target_user["OrganizationID"]) != int(document_row["OrganizationID"]):
             return jsonify({"error": "Access can only be granted to users in the same organization"}), 403
 
-        existing = db_session.execute(
-            text(
-                """
-                SELECT `PermissionID`
-                FROM `Permissions`
-                WHERE `DocID` = :doc_id AND `UserID` = :user_id AND `AccessType` = :access_type
-                """
-            ),
+        existing = _query_shard_first(
+            doc_shard_index,
+            f"""
+            SELECT `PermissionID`
+            FROM `{_project_permission_table(doc_shard_index)}`
+            WHERE `DocID` = :doc_id AND `UserID` = :user_id AND `AccessType` = :access_type
+            """,
             {"doc_id": doc_id, "user_id": user_id, "access_type": access_type},
-        ).first()
+        )
 
         if existing is not None:
-            return jsonify({"message": "Permission already exists", "PermissionID": existing[0]}), 200
+            return jsonify({"message": "Permission already exists", "PermissionID": existing["PermissionID"]}), 200
 
-        permission_id = next_numeric_id(db_session, "Permissions", "PermissionID")
-        db_session.execute(
+        permission_id = next_numeric_id(project_session, _project_permission_table(doc_shard_index), "PermissionID")
+        project_session.execute(
             text(
-                """
-                INSERT INTO `Permissions` (`PermissionID`, `DocID`, `UserID`, `AccessType`, `GrantedAt`)
+                f"""
+                INSERT INTO `{_project_permission_table(doc_shard_index)}` (`PermissionID`, `DocID`, `UserID`, `AccessType`, `GrantedAt`)
                 VALUES (:permission_id, :doc_id, :user_id, :access_type, :granted_at)
                 """
             ),
@@ -1522,6 +1614,7 @@ def grant_permission():
             },
         )
 
+        project_session.commit()
         log_audit_event(
             db_session=db_session,
             action="grant_permission",
@@ -1538,15 +1631,24 @@ def grant_permission():
             },
         )
 
-        db_session.commit()
         return jsonify({"message": "Permission granted", "PermissionID": permission_id}), 201
 
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"Invalid input: {str(e)}"}), 400
     except IntegrityError as e:
+        try:
+            if 'project_session' in locals() and project_session is not None:
+                project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Database integrity error: {str(e.orig)}"}), 409
     except Exception as e:
+        try:
+            if 'project_session' in locals() and project_session is not None:
+                project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Failed to grant permission: {str(e)}"}), 500
 
@@ -1559,21 +1661,13 @@ def list_document_permissions(doc_id: int):
         if not ready:
             return response, status_code
 
-        db_session = g.db_session
         auth_context = g.auth_context
 
-        document_row = db_session.execute(
-            text(
-                """
-                SELECT `DocID`, `DocName`, `OwnerUserID`, `OrganizationID`
-                FROM `Documents`
-                WHERE `DocID` = :doc_id
-                """
-            ),
-            {"doc_id": doc_id},
-        ).mappings().first()
+        document_row, doc_shard_index = _project_lookup_document(doc_id)
         if document_row is None:
             return jsonify({"error": "Document not found"}), 404
+
+        document_row = dict(document_row)
 
         is_admin = auth_context.core_user.role == "Admin"
         is_owner = (
@@ -1583,37 +1677,21 @@ def list_document_permissions(doc_id: int):
         if not (is_admin or is_owner):
             return jsonify({"error": "Only the document owner or an admin can view access settings"}), 403
 
-        permission_rows = db_session.execute(
-            text(
-                """
-                SELECT p.`PermissionID`, p.`DocID`, p.`UserID`, p.`AccessType`, p.`GrantedAt`,
-                       u.`Name` AS `UserName`, u.`Email` AS `UserEmail`
-                FROM `Permissions` p
-                LEFT JOIN `Users` u ON u.`UserID` = p.`UserID`
-                WHERE p.`DocID` = :doc_id
-                ORDER BY p.`GrantedAt` DESC, p.`PermissionID` DESC
-                """
-            ),
+        permission_rows = _query_shard_mappings(
+            doc_shard_index,
+            f"""
+            SELECT p.`PermissionID`, p.`DocID`, p.`UserID`, p.`AccessType`, p.`GrantedAt`,
+                   u.`Name` AS `UserName`, u.`Email` AS `UserEmail`
+            FROM `{_project_permission_table(doc_shard_index)}` p
+            LEFT JOIN `{_project_user_table(doc_shard_index)}` u ON u.`UserID` = p.`UserID`
+            WHERE p.`DocID` = :doc_id
+            ORDER BY p.`GrantedAt` DESC, p.`PermissionID` DESC
+            """,
             {"doc_id": doc_id},
-        ).mappings().all()
+        )
 
-        member_rows = db_session.execute(
-            text(
-                """
-                SELECT `UserID`, `Name`, `Email`, `AccountStatus`
-                FROM `Users`
-                WHERE `OrganizationID` = :organization_id
-                  AND `UserID` <> :owner_user_id
-                  AND `AccountStatus` = 'Active'
-                ORDER BY `UserID`
-                LIMIT 500
-                """
-            ),
-            {
-                "organization_id": int(document_row["OrganizationID"]),
-                "owner_user_id": int(document_row["OwnerUserID"]),
-            },
-        ).mappings().all()
+        member_rows = _project_members_for_org(int(document_row["OrganizationID"]))
+        member_rows = [row for row in member_rows if int(row["UserID"]) != int(document_row["OwnerUserID"])]
 
         return jsonify(
             {
@@ -1669,32 +1747,29 @@ def revoke_permission():
 
         permission_id = int(permission_id)
 
-        permission_row = db_session.execute(
-            text(
-                """
-                SELECT p.`PermissionID`, p.`DocID`, p.`UserID`, p.`AccessType`,
-                       d.`OwnerUserID`, d.`OrganizationID`
-                FROM `Permissions` p
-                JOIN `Documents` d ON d.`DocID` = p.`DocID`
-                WHERE p.`PermissionID` = :permission_id
-                """
-            ),
-            {"permission_id": permission_id},
-        ).mappings().first()
+        permission_row, permission_shard_index = _project_lookup_permission(permission_id)
 
         if permission_row is None:
             return jsonify({"error": "Permission not found"}), 404
 
+        permission_row = dict(permission_row)
+        document_row, _ = _project_lookup_document(int(permission_row["DocID"]), permission_shard_index)
+        if document_row is None:
+            return jsonify({"error": "Permission document not found"}), 404
+
+        document_row = dict(document_row)
+
         is_admin = auth_context.core_user.role == "Admin"
         is_owner = (
             auth_context.project_user_id is not None
-            and int(auth_context.project_user_id) == int(permission_row["OwnerUserID"])
+            and int(auth_context.project_user_id) == int(document_row["OwnerUserID"])
         )
         if not (is_admin or is_owner):
             return jsonify({"error": "Only the document owner or an admin can revoke access"}), 403
 
-        db_session.execute(
-            text("DELETE FROM `Permissions` WHERE `PermissionID` = :permission_id"),
+        project_session = get_shard_session(permission_shard_index)
+        project_session.execute(
+            text(f"DELETE FROM `{_project_permission_table(permission_shard_index)}` WHERE `PermissionID` = :permission_id"),
             {"permission_id": permission_id},
         )
 
@@ -1713,12 +1788,18 @@ def revoke_permission():
             },
         )
 
+        project_session.commit()
         db_session.commit()
         return jsonify({"message": "Permission revoked", "PermissionID": permission_id})
 
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"Invalid input: {str(e)}"}), 400
     except Exception as e:
+        try:
+            if 'project_session' in locals():
+                project_session.rollback()
+        except Exception:
+            pass
         db_session.rollback()
         return jsonify({"error": f"Failed to revoke permission: {str(e)}"}), 500
 
@@ -1781,28 +1862,30 @@ def detect_unauthorized_changes():
         except ValueError:
             tracking_started_at = datetime.utcnow()
 
-    suspicious_rows = db_session.execute(
-        text(
-            """
-            SELECT d.`DocID`, d.`LastModifiedAt`, a.last_audit_at
-            FROM `Documents` d
-            LEFT JOIN (
-                SELECT CAST(`entity_id` AS UNSIGNED) AS doc_id, MAX(`created_at`) AS last_audit_at
-                FROM `CoreAuditLogs`
-                WHERE `entity` = 'Documents'
-                  AND `action` IN ('create_document', 'update_document', 'delete_document')
-                  AND `status` = 'SUCCESS'
-                GROUP BY CAST(`entity_id` AS UNSIGNED)
-            ) a ON a.doc_id = d.`DocID`
-            WHERE d.`LastModifiedAt` >= :tracking_started_at
-              AND (a.last_audit_at IS NULL OR a.last_audit_at < d.`LastModifiedAt`)
-              AND d.DocID = 3
-            ORDER BY d.`LastModifiedAt` DESC
-            LIMIT 200
-            """
-        ),
-        {"tracking_started_at": tracking_started_at},
-    ).mappings().all()
+        suspicious_rows: list[dict[str, Any]] = []
+        for shard_index in get_shard_indices():
+                suspicious_rows.extend(
+                        _query_shard_mappings(
+                                shard_index,
+                                f"""
+                                SELECT d.`DocID`, d.`LastModifiedAt`, a.last_audit_at
+                                FROM `{_project_document_table(shard_index)}` d
+                                LEFT JOIN (
+                                        SELECT CAST(`entity_id` AS UNSIGNED) AS doc_id, MAX(`created_at`) AS last_audit_at
+                                        FROM `CoreAuditLogs`
+                                        WHERE `entity` = 'Documents'
+                                            AND `action` IN ('create_document', 'update_document', 'delete_document')
+                                            AND `status` = 'SUCCESS'
+                                        GROUP BY CAST(`entity_id` AS UNSIGNED)
+                                ) a ON a.doc_id = d.`DocID`
+                                WHERE d.`LastModifiedAt` >= :tracking_started_at
+                                    AND (a.last_audit_at IS NULL OR a.last_audit_at < d.`LastModifiedAt`)
+                                ORDER BY d.`LastModifiedAt` DESC
+                                LIMIT 200
+                                """,
+                                {"tracking_started_at": tracking_started_at},
+                        )
+                )
 
     return jsonify(
         {
@@ -1826,32 +1909,34 @@ def explain_documents_query():
     if not ready:
         return response, status_code
 
-    db_session = g.db_session
     org_id = request.args.get("org_id")
 
     if org_id is None:
-        explain_rows = db_session.execute(
-            text(
-                """
-                EXPLAIN SELECT *
-                FROM `Documents`
-                ORDER BY `LastModifiedAt` DESC
-                LIMIT 50
-                """
+        explain_rows: list[dict[str, Any]] = []
+        for shard_index in get_shard_indices():
+            explain_rows.extend(
+                _query_shard_mappings(
+                    shard_index,
+                    f"""
+                    EXPLAIN SELECT *
+                    FROM `{_project_document_table(shard_index)}`
+                    ORDER BY `LastModifiedAt` DESC
+                    LIMIT 50
+                    """,
+                )
             )
-        ).mappings().all()
     else:
-        explain_rows = db_session.execute(
-            text(
-                """
-                EXPLAIN SELECT *
-                FROM `Documents`
-                WHERE `OrganizationID` = :org_id
-                ORDER BY `LastModifiedAt` DESC
-                LIMIT 50
-                """
-            ),
+        shard_index = shard_index_for_organization(int(org_id))
+        explain_rows = _query_shard_mappings(
+            shard_index,
+            f"""
+            EXPLAIN SELECT *
+            FROM `{_project_document_table(shard_index)}`
+            WHERE `OrganizationID` = :org_id
+            ORDER BY `LastModifiedAt` DESC
+            LIMIT 50
+            """,
             {"org_id": int(org_id)},
-        ).mappings().all()
+        )
 
     return jsonify({"explain": [dict(row) for row in explain_rows]})
