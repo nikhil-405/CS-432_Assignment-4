@@ -10,7 +10,7 @@ This document captures the SQL used to split existing tenant data across 3 simul
 Core tables are not sharded and stay on shard 0:
 CoreUsers, CoreSessions, CoreMemberLinks, CoreGroupMemberships, CoreAuditLogs, CoreAuditState, organizations, roles, policies, tags.
 
-## 1) Split queries (run on source database)
+## 1) Queries used to split the original DB
 
 Users (direct by OrganizationID):
 
